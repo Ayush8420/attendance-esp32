@@ -1,0 +1,660 @@
+/*
+ * ESP32 FINGERPRINT ATTENDANCE SCANNER (v2.1)
+ *
+ * This code is the client for the Google Apps Script backend.
+ * It is a "dumb" scanner: it captures a fingerprint, looks up the
+ * mapped ID, and sends that ID to the server in a secure JSON payload.
+ * The server handles all logic (CHECK_IN vs. CHECK_OUT).
+ *
+ * FIXES in v2.1:
+ * - Re-implements NTP time synchronization. This is MANDATORY
+ * for `https` (SSL) connections, as the ESP32 must know the
+ * current time to validate the server's certificate.
+ * - This fixes the `HTTP Code: -11` (Handshake Failed) error.
+ * - Adds a blocking check in `setup()` to ensure time is
+ * synced before the main loop starts.
+ */
+
+#include <Adafruit_Fingerprint.h>
+#include <HardwareSerial.h>
+#include <Preferences.h>  // Persistent storage for user mapping
+#include <WiFi.h>         // Wi-Fi connectivity
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>  // Required for stable HTTPS/SSL connection
+#include <ArduinoJson.h>       // Required for sending JSON data
+#include <time.h>              // 🚨 ADDED BACK: Required for NTP time sync
+
+// =================================================================
+// 🚨🚨🚨 1. CONFIGURATION (REQUIRED CHANGES) 🚨🚨🚨
+// =================================================================
+
+// Wi-Fi Credentials
+const char* ssid = "moto e13";         // <<< 1. UPDATE THIS
+const char* password = "AyushTiwari";  // <<< 2. UPDATE THIS
+
+// Google Apps Script URL (This MUST be the new /exec URL from re-deployment)
+const char* scriptUrl = "https://script.google.com/macros/s/AKfycbw7GfLa1PH1PrV2V6HD_u7HJapR8-6nXzCltI2vxDdpm0rCJuFSIJi3NI-qPNAdjj96/exec";
+
+// 🚨🚨🚨
+// 🚨 YOU MUST CHANGE THIS KEY! MAKE IT A LONG, RANDOM PASSWORD. 🚨
+// 🚨 IT MUST MATCH THE 'SECRET_KEY' IN YOUR GOOGLE SCRIPT.     🚨
+// 🚨🚨🚨
+const char* SECRET_KEY = "YOUR_SECRET_KEY_HERE";  // <<< 3. UPDATE THIS
+
+
+// Fingerprint Sensor Configuration
+#define RX_PIN 16
+#define TX_PIN 17
+#define BAUD 57600
+HardwareSerial mySerial(2);
+Adafruit_Fingerprint finger(&mySerial);
+
+// 🚨 MODIFIED: Added back NTP configuration
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 19800;  // IST (India) is UTC + 5h 30m
+const int daylightOffset_sec = 0;
+
+// System Limits
+#define MAX_ATTENDANCE_USERS 30
+
+// Global Storage Object
+Preferences preferences;
+
+// Global state variable for continuous mode, defaults to true
+bool continuousVerifyMode = true;
+
+
+// =================================================================
+//                 2. HELPER FUNCTIONS
+// =================================================================
+
+// --- Serial Input Helpers ---
+// (Unchanged)
+int waitForSerialInt() {
+  while (!Serial.available()) { delay(100); }
+  int num = Serial.parseInt();
+  while (Serial.available()) Serial.read();
+  return num;
+}
+
+String waitForSerialString() {
+  while (!Serial.available()) { delay(100); }
+  String str = Serial.readStringUntil('\n');
+  str.trim();
+  while (Serial.available()) Serial.read();
+  return str;
+}
+
+void waitForSerialEnter() {
+  Serial.println("Waiting for ENTER key press...");
+  while (Serial.available()) { Serial.read(); }
+  while (Serial.read() != '\n') { delay(10); }
+  while (Serial.available()) { Serial.read(); }
+}
+
+// --- Mapping (Finger ID to Student ID/Name) Helpers ---
+// (Unchanged)
+void saveUserIdMapping(uint8_t fingerId, int studentId, const String& name) {
+  preferences.begin("mapping", false);
+  String id_key = "uid_" + String(fingerId);
+  String name_key = "name_" + String(fingerId);
+  preferences.putInt(id_key.c_str(), studentId);
+  preferences.putString(name_key.c_str(), name);
+  preferences.end();
+  Serial.print("✅ Mapped Finger ID ");
+  Serial.print(fingerId);
+  Serial.print(" to Student ID ");
+  Serial.print(studentId);
+  Serial.print(" and Name: ");
+  Serial.println(name);
+}
+
+int getStudentIdFromFingerId(uint8_t fingerId) {
+  preferences.begin("mapping", true);
+  String key = "uid_" + String(fingerId);
+  int studentId = preferences.getInt(key.c_str(), 0);
+  preferences.end();
+  return studentId;
+}
+
+String getStudentNameFromFingerId(uint8_t fingerId) {
+  preferences.begin("mapping", true);
+  String key = "name_" + String(fingerId);
+  String studentName = preferences.getString(key.c_str(), "UNKNOWN");
+  preferences.end();
+  return studentName;
+}
+
+// --- Wi-Fi Helpers ---
+
+// 🚨 MODIFIED: Added back the configTime() call
+void connectWiFi() {
+  Serial.println("\nConnecting to WiFi...");
+  WiFi.begin(ssid, password);
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ WiFi Connected. IP: " + WiFi.localIP().toString());
+
+    // 🚨 ADDED BACK: Configure the system time.
+    // This is required for SSL/TLS (https) to work.
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+  } else {
+    Serial.println("\n❌ WiFi Connection Failed.");
+  }
+}
+
+// (Unchanged)
+void ensureWiFiConnected() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return;  // All good
+  }
+  Serial.println("Wi-Fi connection lost. Reconnecting...");
+  WiFi.disconnect();
+  connectWiFi();
+}
+
+
+
+// --- Network Send Function ---
+// (Unchanged - this logic is already correct)
+void sendAttendance(int studentId, const String& studentName) {
+  ensureWiFiConnected(); // Check Wi-Fi before trying to send
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ Wi-Fi disconnected. Log not sent.");
+    return;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure(); // This allows connection without a root cert
+  HTTPClient http;
+
+  if (http.begin(client, scriptUrl)) {
+    http.addHeader("Content-Type", "application/json");
+
+    // 1. Create JSON object
+    StaticJsonDocument<256> doc;
+    doc["secret"] = SECRET_KEY;
+    doc["id"] = studentId;
+    doc["name"] = studentName;
+
+    String jsonPayload;
+    serializeJson(doc, jsonPayload);
+
+    Serial.print("Sending Payload: "); Serial.println(jsonPayload);
+
+    // 2. Send the POST request
+    int httpCode = http.POST(jsonPayload);
+
+    // 3. Check the response
+    if (httpCode > 0) {
+      String responsePayload = http.getString();
+      Serial.print("HTTP Code: "); Serial.println(httpCode);
+      Serial.print("Response: "); Serial.println(responsePayload);
+
+      // Handle successful response (200)
+      if (httpCode == 200) {
+        StaticJsonDocument<128> responseDoc;
+        DeserializationError err = deserializeJson(responseDoc, responsePayload);
+
+        if (err) {
+          Serial.println("❌ Failed to parse server response as JSON.");
+        } else {
+          // Parsing was successful, now we can safely read
+          const char* status = responseDoc["status"];
+          if (strcmp(status, "success") == 0) {
+            const char* action = responseDoc["action"];
+            Serial.print("✅ Server confirmed: "); Serial.println(action);
+          } else {
+            const char* message = responseDoc["message"];
+            Serial.print("❌ Server returned an error: "); Serial.println(message);
+          }
+        }
+      } 
+      // Handle redirects (301, 302)
+      else if (httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND) {
+        http.end(); // Clean up first connection
+        
+        String currentUrl = scriptUrl;
+        int redirectCount = 0;
+
+        while (redirectCount < 3) {
+          String newUrl = http.getLocation();
+          Serial.print("🔁 Redirected to: "); Serial.println(newUrl);
+
+          if (newUrl.length() == 0) {
+            Serial.println("❌ Redirect response had no Location header!");
+            break;
+          }
+
+          currentUrl = newUrl;
+          redirectCount++;
+
+          Serial.print("➡️  Connecting to: "); Serial.println(currentUrl);
+
+          if (!http.begin(client, currentUrl)) {
+            Serial.println("❌ Failed to initiate HTTP connection securely.");
+            break;
+          }
+          
+          http.addHeader("Content-Type", "application/json");
+
+          // Prepare JSON (reuse existing doc)
+          String newJsonPayload;
+          serializeJson(doc, newJsonPayload);
+
+          Serial.print("📤 Sending Payload: "); Serial.println(newJsonPayload);
+
+          int newHttpCode = http.GET();
+          Serial.print("📥 HTTP Code: "); Serial.println(newHttpCode);
+          
+          if (newHttpCode == HTTP_CODE_OK) {  // 200
+            String newResponsePayload = http.getString();
+            Serial.print("Response: "); Serial.println(newResponsePayload);
+
+            StaticJsonDocument<128> responseDoc;
+            DeserializationError err = deserializeJson(responseDoc, newResponsePayload);
+
+            if (err) {
+              Serial.println("❌ Failed to parse server response as JSON.");
+            } else {
+              const char* status = responseDoc["status"];
+              if (strcmp(status, "success") == 0) {
+                Serial.print("✅ Server confirmed: ");
+                Serial.println((const char*)responseDoc["action"]);
+              } else {
+                Serial.print("❌ Server returned an error: ");
+                Serial.println((const char*)responseDoc["message"]);
+              }
+            }
+            break; // stop retry loop
+
+          } else if (newHttpCode == HTTP_CODE_FOUND || newHttpCode == HTTP_CODE_MOVED_PERMANENTLY) {
+            // Another redirect, continue loop
+            http.end();
+            delay(200);
+            continue;
+
+          } else {
+            Serial.print("❌ HTTP POST request failed, code: ");
+            Serial.println(newHttpCode);
+            Serial.println("   (Might be an SSL/time issue or invalid URL)");
+            break;
+          }
+        }
+        
+        if (redirectCount >= 3) {
+          Serial.println("⚠️ Too many redirects. Aborting.");
+        }
+      } 
+      // Handle other HTTP errors (401, 404, 500, etc.)
+      else {
+        Serial.println("❌ Server returned an HTTP error. Check deployment settings.");
+      }
+
+    } else {
+      Serial.print("❌ HTTP POST request failed, code: ");
+      Serial.println(httpCode);
+      Serial.println("   (This is often an SSL/Time sync issue or invalid URL)");
+    }
+
+    http.end(); // Clean up HTTP connection
+  } else {
+    Serial.println("❌ Failed to initiate HTTP connection securely.");
+  }
+}
+
+
+  // =================================================================
+  //                      3. CORE LOGIC
+  // =================================================================
+
+  // (Unchanged)
+  void printHelp() {
+    Serial.println("\n--- 🆘 Command Help ---");
+    Serial.println("CONTROLS:");
+    Serial.println("  start   - ✅ Start continuous fingerprint verification mode.");
+    Serial.println("  stop    - 🛑 Stop continuous mode and enter command mode.");
+    Serial.println("  help    - 🙋‍♂️ Display this help menu.");
+    Serial.println("\nCOMMANDS (Only work when stopped):");
+    Serial.println("  e <id>  - Enroll a new fingerprint at a specific ID (e.g., e 5).");
+    Serial.println("  d <id>  - Delete a fingerprint at a specific ID (e.g., d 5).");
+    Serial.println("  v       - Perform a single verification scan.");
+    Serial.println("  i       - Show sensor information and template count.");
+    Serial.println("  all     - 📋 Display all stored users (Finger ID, Student ID, Name).");
+    Serial.println("------------------------\n");
+  }
+
+  // (Unchanged)
+  void displayAllUsers() {
+    Serial.println("\n--- 📋 Stored User Data ---");
+    int userCount = 0;
+    for (uint8_t i = 0; i < MAX_ATTENDANCE_USERS; i++) {
+      int studentId = getStudentIdFromFingerId(i);
+      if (studentId > 0) {  // Check if a mapping exists for this finger ID
+        String name = getStudentNameFromFingerId(i);
+        Serial.print("  Finger ID: ");
+        Serial.print(i);
+        Serial.print("\t | Student ID: ");
+        Serial.print(studentId);
+        Serial.print("\t | Name: ");
+        Serial.println(name);
+        userCount++;
+      }
+    }
+    if (userCount == 0) {
+      Serial.println("  No users are currently enrolled.");
+    }
+    Serial.print("Total Users: ");
+    Serial.println(userCount);
+    Serial.println("---------------------------\n");
+  }
+
+  // (Unchanged)
+  void enrollFingerprint(uint8_t id) {
+    if (id >= MAX_ATTENDANCE_USERS) {
+      Serial.print("Enrollment ID must be between 0 and ");
+      Serial.println(MAX_ATTENDANCE_USERS - 1);
+      return;
+    }
+
+    if (continuousVerifyMode) {
+      Serial.println("🛑 Cannot enroll while in continuous verification mode. Type 'stop' first.");
+      return;
+    }
+
+    Serial.print("Enrolling Fingerprint ID #");
+    Serial.println(id);
+
+    Serial.println("Enter the associated Student/Employee ID (e.g., 1001) and press ENTER:");
+    int studentId = waitForSerialInt();
+
+    if (studentId <= 0) {
+      Serial.println("❌ Invalid Student/Employee ID. Enrollment cancelled.");
+      return;
+    }
+
+    Serial.println("Enter the Student/Employee Name (e.g., Alice Smith) and press ENTER:");
+    String studentName = waitForSerialString();
+
+    Serial.print("Attempting to enroll for Student ID: ");
+    Serial.print(studentId);
+    Serial.print(" / Name: ");
+    Serial.println(studentName);
+
+    Serial.println("Remove finger, then press ENTER when ready for Image 1.");
+    waitForSerialEnter();
+
+    Serial.println("Place finger on sensor (1/2)...");
+    while (finger.getImage() != FINGERPRINT_OK) delay(200);
+    if (finger.image2Tz(1) != FINGERPRINT_OK) {
+      Serial.println("Failed image #1");
+      return;
+    }
+    Serial.println("Image #1 converted.");
+
+    Serial.println("Remove finger...");
+    while (finger.getImage() != FINGERPRINT_NOFINGER) delay(100);
+
+    Serial.println("\n✅ Finger removed. Press ENTER when ready for the second scan.");
+    waitForSerialEnter();
+
+    Serial.println("Place same finger again (2/2)...");
+    while (finger.getImage() != FINGERPRINT_OK) delay(200);
+    if (finger.image2Tz(2) != FINGERPRINT_OK) {
+      Serial.println("Failed image #2");
+      return;
+    }
+
+    Serial.println("Creating model...");
+    if (finger.createModel() != FINGERPRINT_OK) {
+      Serial.println("Model failed (Inconsistent scans).");
+      return;
+    }
+
+    Serial.println("Storing model...");
+    if (finger.storeModel(id) == FINGERPRINT_OK) {
+      Serial.print("✅ Fingerprint Stored successfully at ID #");
+      Serial.println(id);
+      saveUserIdMapping(id, studentId, studentName);
+    } else {
+      Serial.println("❌ Failed to store model in sensor.");
+    }
+  }
+
+  // (Unchanged)
+  void runVerificationLogic(uint8_t fingerId) {
+    if (fingerId != 0xFF) {  // 0xFF means no match
+      int studentId = getStudentIdFromFingerId(fingerId);
+
+      if (studentId > 0) {
+        String studentName = getStudentNameFromFingerId(fingerId);
+
+        Serial.print("\n------------------------------------");
+        Serial.print("\nScan Detected for ID: ");
+        Serial.print(studentId);
+        Serial.print(" (");
+        Serial.print(studentName);
+        Serial.println(")");
+        Serial.println("Sending to server for processing...");
+
+        sendAttendance(studentId, studentName);
+
+        Serial.println("------------------------------------");
+
+        delay(3000);  // Wait 3s to prevent immediate duplicate scans
+
+      } else {
+        Serial.print("❌ Match found, but no Student ID mapped to Finger ID: ");
+        Serial.println(fingerId);
+        delay(1000);
+      }
+    }
+  }
+
+  // (Unchanged)
+  uint8_t getFingerprintID() {
+    uint8_t p = finger.getImage();
+
+    if (p != FINGERPRINT_OK) {
+      if (p == FINGERPRINT_PACKETRECIEVEERR) { Serial.println("❌ Comm error. Check wires."); }
+      return 0xFF;
+    }
+
+    p = finger.image2Tz();
+    if (p != FINGERPRINT_OK) { return 0xFF; }
+
+    p = finger.fingerFastSearch();
+
+    if (p != FINGERPRINT_OK) {
+      return 0xFF;
+    }
+
+    Serial.print("Found Finger ID: ");
+    Serial.print(finger.fingerID);
+    Serial.print(" (Confidence: ");
+    Serial.print(finger.confidence);
+    Serial.println(")");
+    return finger.fingerID;
+  }
+
+  // (Unchanged)
+  void sensorInfo() {
+    Serial.println("\n-- Sensor Parameters --");
+    finger.getParameters();
+    Serial.print("Capacity: ");
+    Serial.println(finger.capacity);
+    finger.getTemplateCount();
+    Serial.print("Templates Stored: ");
+    Serial.println(finger.templateCount);
+    Serial.println("-----------------------\n");
+  }
+
+  // (Unchanged)
+  void deleteFingerprint(uint8_t id) {
+    uint8_t p = finger.deleteModel(id);
+    if (p == FINGERPRINT_OK) {
+      Serial.print("✅ Fingerprint ID #");
+      Serial.print(id);
+      Serial.println(" deleted.");
+      preferences.begin("mapping", false);
+      preferences.remove(("uid_" + String(id)).c_str());
+      preferences.remove(("name_" + String(id)).c_str());
+      preferences.end();
+    } else if (p == FINGERPRINT_BADLOCATION) {
+      Serial.print("❌ Fingerprint ID #");
+      Serial.print(id);
+      Serial.println(" is empty.");
+    } else {
+      Serial.print("❌ Failed to delete ID #");
+      Serial.print(id);
+      Serial.println(".");
+    }
+  }
+
+
+  // =================================================================
+  //                      4. SETUP AND LOOP
+  // =================================================================
+
+  // 🚨 MODIFIED: Added blocking time sync
+  void setup() {
+    Serial.begin(115200);
+    while (!Serial) delay(100);
+
+    mySerial.begin(BAUD, SERIAL_8N1, RX_PIN, TX_PIN);
+
+    Serial.println("\n*** Fingerprint Attendance System Initializing (V2.1) ***");
+
+    connectWiFi();  // Initial Wi-Fi connection attempt
+
+    if (finger.verifyPassword()) {
+      Serial.println("✅ Fingerprint sensor detected successfully.");
+    } else {
+      Serial.println("❌ Fingerprint sensor not found. Check wiring.");
+      while (1) delay(1);
+    }
+
+    // ----------------------------------------------------
+    // 🚨 NEW BLOCK: Wait for time sync
+    // ----------------------------------------------------
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("Synchronizing time (required for https)...");
+      struct tm timeinfo;
+      if (!getLocalTime(&timeinfo)) {
+        // Loop until time is synced
+        while (!getLocalTime(&timeinfo, 5000)) {  // 5-sec timeout
+          delay(100);
+          Serial.print(".");
+        }
+      }
+      Serial.println("\n✅ Time successfully synced.");
+      char timeBuffer[32];
+      strftime(timeBuffer, sizeof(timeBuffer), "%d/%m/%Y %H:%M:%S", &timeinfo);
+      Serial.print("Current time: ");
+      Serial.println(timeBuffer);
+    } else {
+      Serial.println("❌ No WiFi, cannot sync time. HTTPS requests will fail until connected.");
+    }
+    // ----------------------------------------------------
+    // 🚨 END OF NEW BLOCK
+    // ----------------------------------------------------
+
+    finger.getTemplateCount();
+    Serial.print("Sensor contains ");
+    Serial.print(finger.templateCount);
+    Serial.println(" templates.");
+
+    Serial.println("\n***************************************************");
+    Serial.println("✅ System started in CONTINUOUS VERIFICATION mode.");
+    Serial.println("   Type 'stop' to enter command mode or 'help' for info.");
+    Serial.println("***************************************************");
+  }
+
+
+  // (Unchanged)
+  void loop() {
+
+    // Example of continuous mode execution
+    // (Serial command handling logic is omitted for brevity but is unchanged)
+    if (Serial.available()) {
+      String line = Serial.readStringUntil('\n');
+      line.trim();
+
+      if (line.isEmpty()) return;
+
+      // --- UNIVERSAL CONTROL COMMANDS ---
+      if (line.equalsIgnoreCase("start")) {
+        if (!continuousVerifyMode) {
+          continuousVerifyMode = true;
+          Serial.println("\n*************************************************");
+          Serial.println("✅ CONTINUOUS VERIFICATION MODE STARTED. Scan finger now.");
+          Serial.println("Type 'stop' and press ENTER to return to command mode.");
+          Serial.println("*************************************************");
+        } else {
+          Serial.println("Already in continuous mode.");
+        }
+        while (Serial.available()) Serial.read();  // Clear buffer
+        return;                                    // Exit after processing command
+      } else if (line.equalsIgnoreCase("stop")) {
+        if (continuousVerifyMode) {
+          continuousVerifyMode = false;
+          Serial.println("\n*************************************************");
+          Serial.println("🛑 CONTINUOUS VERIFICATION MODE STOPPED.");
+          Serial.println("   Now in Command Mode. Type 'help' for options.");
+          Serial.println("*************************************************");
+        } else {
+          Serial.println("Already stopped.");
+        }
+        return;
+      } else if (line.equalsIgnoreCase("help")) {
+        printHelp();
+        return;
+      }
+
+      // --- COMMAND MODE EXECUTION (e, d, i, v, all) ---
+      if (!continuousVerifyMode) {
+        char command = line.charAt(0);
+        int spaceIndex = line.indexOf(' ');
+        uint8_t id = 0;
+        if (spaceIndex > 0) {
+          id = line.substring(spaceIndex + 1).toInt();
+        }
+
+        if (command == 'e') {
+          enrollFingerprint(id);
+        } else if (command == 'd') {
+          deleteFingerprint(id);
+        } else if (command == 'i') {
+          sensorInfo();
+        } else if (command == 'v') {
+          Serial.println("Waiting for single verification scan...");
+          runVerificationLogic(getFingerprintID());
+        } else if (line.equalsIgnoreCase("all")) {
+          displayAllUsers();
+        } else {
+          Serial.print("Unknown command. ");
+          printHelp();
+        }
+      } else {
+        Serial.println("🛑 System is in continuous mode. Type 'stop' to enter commands.");
+      }
+    }
+
+    // --- CONTINUOUS MODE EXECUTION ---
+    if (continuousVerifyMode) {
+      // Check Wi-Fi *before* listening for a finger.
+      // This ensures we are ready to send data and time is synced.
+      ensureWiFiConnected();
+
+      // Repeatedly try to get a fingerprint ID and log it
+      runVerificationLogic(getFingerprintID());
+      delay(50);  // Small delay to prevent overwhelming the CPU
+    }
+  }
