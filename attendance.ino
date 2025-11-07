@@ -33,13 +33,13 @@ const char* ssid = "moto e13";         // <<< 1. UPDATE THIS
 const char* password = "AyushTiwari";  // <<< 2. UPDATE THIS
 
 // Google Apps Script URL (This MUST be the new /exec URL from re-deployment)
-const char* scriptUrl = "https://script.google.com/macros/s/AKfycbw7GfLa1PH1PrV2V6HD_u7HJapR8-6nXzCltI2vxDdpm0rCJuFSIJi3NI-qPNAdjj96/exec";
+const char* scriptUrl = "https://script.google.com/macros/s/AKfycbyFgwD090p4we_Agrqx_J8cl7P1OMtZVXU5LMzg8S6AQg8ljogsglgK6rcWCHz6UKo4/exec";
 
 // 🚨🚨🚨
 // 🚨 YOU MUST CHANGE THIS KEY! MAKE IT A LONG, RANDOM PASSWORD. 🚨
 // 🚨 IT MUST MATCH THE 'SECRET_KEY' IN YOUR GOOGLE SCRIPT.     🚨
 // 🚨🚨🚨
-const char* SECRET_KEY = "YOUR_SECRET_KEY_HERE";  // <<< 3. UPDATE THIS
+const char* SECRET_KEY = "x2VQTpWYKz09xckRHJvoVKrnrmMA5VBw";  // <<< 3. UPDATE THIS
 
 
 // Fingerprint Sensor Configuration
