@@ -29,11 +29,11 @@
 // =================================================================
 
 // Wi-Fi Credentials
-const char* ssid = "moto e13";         // <<< 1. UPDATE THIS
-const char* password = "AyushTiwari";  // <<< 2. UPDATE THIS
+const char* ssid = "Airtel_Zerotouch";         // <<< 1. UPDATE THIS
+const char* password = "Airtel@123";  // <<< 2. UPDATE THIS
 
 // Google Apps Script URL (This MUST be the new /exec URL from re-deployment)
-const char* scriptUrl = "https://script.google.com/macros/s/AKfycbyFgwD090p4we_Agrqx_J8cl7P1OMtZVXU5LMzg8S6AQg8ljogsglgK6rcWCHz6UKo4/exec";
+const char* scriptUrl = "https://script.google.com/macros/s/AKfycbwBXFSbXjVFFzVTWAMLsTAcKalm8BJzpGRW9VNvrKJZd1STi1o0B2Ez895GYJKNg2_o/exec";
 
 // 🚨🚨🚨
 // 🚨 YOU MUST CHANGE THIS KEY! MAKE IT A LONG, RANDOM PASSWORD. 🚨
