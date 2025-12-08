@@ -1,7 +1,3 @@
-#include <micro_ros_arduino.h>
-
-#include <micro_ros_arduino.h>
-
 /*
  * ESP32 FINGERPRINT ATTENDANCE SCANNER (v2.2)
  *
